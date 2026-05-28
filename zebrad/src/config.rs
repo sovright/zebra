@@ -129,12 +129,22 @@ pub struct LocalGenesisConfig {
 }
 
 impl LocalGenesisConfig {
-    /// Decode the configured 32-byte seed from hex.
+    /// Decode the configured 32-byte seed from a 64-character hex string.
     pub fn seed_bytes(&self) -> Result<[u8; 32], String> {
-        let bytes = hex::decode(self.seed.trim())
-            .map_err(|e| format!("local_genesis.seed is not valid hex: {e}"))?;
-        <[u8; 32]>::try_from(bytes.as_slice())
-            .map_err(|_| "local_genesis.seed must decode to exactly 32 bytes".to_string())
+        let s = self.seed.trim();
+        if s.len() != 64 {
+            return Err(format!(
+                "local_genesis.seed must be 64 hex chars (32 bytes), got {}",
+                s.len()
+            ));
+        }
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            let start = i * 2;
+            *byte = u8::from_str_radix(&s[start..start + 2], 16)
+                .map_err(|e| format!("local_genesis.seed is not valid hex: {e}"))?;
+        }
+        Ok(out)
     }
 
     /// Build the [`zebra_chain::local_genesis`] options for this config (capped at NU6).
