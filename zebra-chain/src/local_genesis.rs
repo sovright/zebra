@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use rand_core::{OsRng, RngCore};
+use sha2::{Digest, Sha256};
 
 use crate::{
     amount::{Amount, NonNegative},
@@ -48,6 +49,14 @@ pub struct LocalTestnetGenesisOptions {
     pub seeded_tip_time: Option<i64>,
     /// Extra empty blocks to append after funding blocks so premine coinbase outputs can mature.
     pub maturity_padding_blocks: u32,
+    /// Optional 32-byte seed for deterministic funded-key generation.
+    ///
+    /// When set, the same seed + miner names reproduce identical funded keys, and (combined
+    /// with a fixed [`seeded_tip_time`](Self::seeded_tip_time)) an identical genesis/premine
+    /// chain on every run. This is required when a node regenerates the chain at each startup
+    /// and commits the same genesis to its state. When `None`, keys come from `OsRng` and are
+    /// not reproducible.
+    pub seed: Option<[u8; 32]>,
 }
 
 impl Default for LocalTestnetGenesisOptions {
@@ -59,6 +68,7 @@ impl Default for LocalTestnetGenesisOptions {
             target_spacing_secs: 1,
             seeded_tip_time: None,
             maturity_padding_blocks: 0,
+            seed: None,
         }
     }
 }
@@ -131,13 +141,32 @@ pub fn generate_local_testnet_with_funded_keys(
     let funded_keys: Vec<FundedKey> = miner_names
         .into_iter()
         .map(|name| {
-            let secret_key = loop {
-                let mut secret_bytes = [0u8; 32];
-                rng.fill_bytes(&mut secret_bytes);
-
-                if let Ok(secret_key) = secp256k1::SecretKey::from_slice(&secret_bytes) {
-                    break secret_key;
+            let secret_key = match options.seed {
+                // Deterministic: derive from sha256(seed || name || counter), retrying the
+                // counter until the 32 bytes form a valid secp256k1 scalar.
+                Some(seed) => {
+                    let mut counter: u32 = 0;
+                    loop {
+                        let mut hasher = Sha256::new();
+                        hasher.update(seed);
+                        hasher.update(name.as_bytes());
+                        hasher.update(counter.to_le_bytes());
+                        let secret_bytes: [u8; 32] = hasher.finalize().into();
+                        if let Ok(secret_key) = secp256k1::SecretKey::from_slice(&secret_bytes) {
+                            break secret_key;
+                        }
+                        counter = counter.checked_add(1).expect("a valid key is found quickly");
+                    }
                 }
+                // Non-deterministic: random keys.
+                None => loop {
+                    let mut secret_bytes = [0u8; 32];
+                    rng.fill_bytes(&mut secret_bytes);
+
+                    if let Ok(secret_key) = secp256k1::SecretKey::from_slice(&secret_bytes) {
+                        break secret_key;
+                    }
+                },
             };
             let public_key = secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
             let pub_key_bytes = public_key.serialize();
