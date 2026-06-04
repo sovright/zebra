@@ -93,6 +93,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "pre_blossom_halving_interval = {}",
         params.pre_blossom_halving_interval()
     );
+    // Checkpoints as [height, [byte-array]] pairs. Upstream `block::Hash` derives
+    // plain serde over `Hash([u8; 32])`, so each hash must be its INTERNAL bytes
+    // (`hash.0`) — already the reverse of the display hex; do NOT reverse again.
+    println!("checkpoints = [");
+    for (height, hash) in &generated.checkpoints {
+        println!("  [{}, {:?}],", height.0, hash.0);
+    }
+    println!("]");
     println!();
     println!("[network.testnet_parameters.activation_heights]");
     for (height, upgrade) in generated.network.full_activation_list() {
@@ -100,6 +108,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("{key} = {}", height.0);
         }
     }
+    println!();
+    // Empty funding streams: otherwise upstream keeps its default testnet streams,
+    // whose address-period check panics at config load against halving_interval=144.
+    println!("[network.testnet_parameters.pre_nu6_funding_streams]");
+    println!("recipients = []");
+    println!();
+    println!("[network.testnet_parameters.post_nu6_funding_streams]");
+    println!("recipients = []");
     println!();
     println!("# --- informational (not config) ---");
     println!("# generated blocks: {}", generated.blocks.len());
