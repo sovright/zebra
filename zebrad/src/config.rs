@@ -83,6 +83,84 @@ pub struct ZebradConfig {
     /// See the Zebra Book for details and examples:
     /// <https://zebra.zfnd.org/user/health.html>
     pub health: crate::components::health::Config,
+
+    /// Optional deterministic, isolated, single-node local testnet.
+    ///
+    /// When set, zebrad generates a brand-new chain from a fixed seed at startup
+    /// (genesis + funded premine), uses it as the active network (ignoring
+    /// `[network] network`), and commits the generated blocks to an empty state —
+    /// no peers, no public network. See [`LocalGenesisConfig`].
+    pub local_genesis: Option<LocalGenesisConfig>,
+}
+
+/// Configuration for a deterministic, isolated, single-node local testnet generated
+/// from a fixed seed via [`zebra_chain::local_genesis`].
+///
+/// This runs a brand-new chain from its own genesis with no peers and no public
+/// network. Network upgrades up to NU6 (Orchard + NU6) activate just after the
+/// premine blocks, so the node serves Orchard `getblocktemplate` immediately.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalGenesisConfig {
+    /// Human-readable network name (alphanumeric + underscore, max 30 chars).
+    pub network_name: String,
+
+    /// Miner names to fund with a premine (one 10-ZEC coinbase block each).
+    pub miners: Vec<String>,
+
+    /// Hex-encoded 32-byte seed for deterministic key and chain generation.
+    ///
+    /// The same seed + miners + `tip_time` reproduce an identical genesis on every
+    /// start, which is required for committing the same genesis to state across restarts.
+    pub seed: String,
+
+    /// Fixed UNIX timestamp (seconds) for the seeded tip block.
+    ///
+    /// Pinned (rather than wall-clock) so the generated chain is reproducible.
+    pub tip_time: i64,
+
+    /// Extra empty blocks appended after the premine blocks so coinbase outputs can mature.
+    #[serde(default)]
+    pub maturity_padding_blocks: u32,
+
+    /// If true, skip Equihash proof-of-work validation. Default `false` (a genuinely mined chain).
+    #[serde(default)]
+    pub disable_pow: bool,
+}
+
+impl LocalGenesisConfig {
+    /// Decode the configured 32-byte seed from a 64-character hex string.
+    pub fn seed_bytes(&self) -> Result<[u8; 32], String> {
+        let s = self.seed.trim();
+        if s.len() != 64 {
+            return Err(format!(
+                "local_genesis.seed must be 64 hex chars (32 bytes), got {}",
+                s.len()
+            ));
+        }
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            let start = i * 2;
+            *byte = u8::from_str_radix(&s[start..start + 2], 16)
+                .map_err(|e| format!("local_genesis.seed is not valid hex: {e}"))?;
+        }
+        Ok(out)
+    }
+
+    /// Build the [`zebra_chain::local_genesis`] options for this config (capped at NU6).
+    pub fn to_options(
+        &self,
+    ) -> Result<zebra_chain::local_genesis::LocalTestnetGenesisOptions, String> {
+        Ok(zebra_chain::local_genesis::LocalTestnetGenesisOptions {
+            network_name: self.network_name.clone(),
+            latest_network_upgrade: zebra_chain::parameters::NetworkUpgrade::Nu6,
+            disable_pow: self.disable_pow,
+            target_spacing_secs: 1,
+            seeded_tip_time: Some(self.tip_time),
+            maturity_padding_blocks: self.maturity_padding_blocks,
+            seed: Some(self.seed_bytes()?),
+        })
+    }
 }
 
 impl ZebradConfig {

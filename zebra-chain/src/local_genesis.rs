@@ -7,10 +7,17 @@
 //! All network upgrades activate **after** the premine blocks, so that premine
 //! blocks use the simple pre-Overwinter commitment format (`[0; 32]`). This
 //! avoids computing chain history tree commitments for bootstrapping blocks.
+//!
+//! When a 32-byte `seed` is supplied (see [`LocalTestnetGenesisOptions::seed`]),
+//! the funded keys, the network magic, and — together with a fixed
+//! [`seeded_tip_time`](LocalTestnetGenesisOptions::seeded_tip_time) — the whole
+//! genesis/premine chain are derived deterministically, so the network is
+//! byte-for-byte reproducible across restarts and on external peers.
 
 use std::sync::Arc;
 
 use rand_core::{OsRng, RngCore};
+use sha2::{Digest, Sha256};
 
 use crate::{
     amount::{Amount, NonNegative},
@@ -18,6 +25,7 @@ use crate::{
     block::{self, Block, Header, Height},
     fmt::HexDebug,
     parameters::{
+        constants::magics,
         testnet::{
             ConfiguredActivationHeights, ConfiguredCheckpoints, Parameters as TestnetParams,
         },
@@ -48,6 +56,15 @@ pub struct LocalTestnetGenesisOptions {
     pub seeded_tip_time: Option<i64>,
     /// Extra empty blocks to append after funding blocks so premine coinbase outputs can mature.
     pub maturity_padding_blocks: u32,
+    /// Optional 32-byte seed for deterministic funded-key generation.
+    ///
+    /// When set, the same seed + miner names reproduce identical funded keys and an identical
+    /// network magic, and (combined with a fixed [`seeded_tip_time`](Self::seeded_tip_time)) an
+    /// identical genesis/premine chain on every run. This is required when a node regenerates the
+    /// chain at each startup and commits the same genesis to its state, and so that external peers
+    /// keep recognising the network by its (now stable) magic. When `None`, keys and the network
+    /// magic come from `OsRng` and are not reproducible.
+    pub seed: Option<[u8; 32]>,
 }
 
 impl Default for LocalTestnetGenesisOptions {
@@ -59,6 +76,7 @@ impl Default for LocalTestnetGenesisOptions {
             target_spacing_secs: 1,
             seeded_tip_time: None,
             maturity_padding_blocks: 0,
+            seed: None,
         }
     }
 }
@@ -131,13 +149,32 @@ pub fn generate_local_testnet_with_funded_keys(
     let funded_keys: Vec<FundedKey> = miner_names
         .into_iter()
         .map(|name| {
-            let secret_key = loop {
-                let mut secret_bytes = [0u8; 32];
-                rng.fill_bytes(&mut secret_bytes);
-
-                if let Ok(secret_key) = secp256k1::SecretKey::from_slice(&secret_bytes) {
-                    break secret_key;
+            let secret_key = match options.seed {
+                // Deterministic: derive from sha256(seed || name || counter), retrying the
+                // counter until the 32 bytes form a valid secp256k1 scalar.
+                Some(seed) => {
+                    let mut counter: u32 = 0;
+                    loop {
+                        let mut hasher = Sha256::new();
+                        hasher.update(seed);
+                        hasher.update(name.as_bytes());
+                        hasher.update(counter.to_le_bytes());
+                        let secret_bytes: [u8; 32] = hasher.finalize().into();
+                        if let Ok(secret_key) = secp256k1::SecretKey::from_slice(&secret_bytes) {
+                            break secret_key;
+                        }
+                        counter = counter.checked_add(1).expect("a valid key is found quickly");
+                    }
                 }
+                // Non-deterministic: random keys.
+                None => loop {
+                    let mut secret_bytes = [0u8; 32];
+                    rng.fill_bytes(&mut secret_bytes);
+
+                    if let Ok(secret_key) = secp256k1::SecretKey::from_slice(&secret_bytes) {
+                        break secret_key;
+                    }
+                },
             };
             let public_key = secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
             let pub_key_bytes = public_key.serialize();
@@ -232,9 +269,17 @@ pub fn generate_local_testnet_with_funded_keys(
         .map(|(i, block)| Ok((Height(u32::try_from(i)?), block::Hash::from(&*block.header))))
         .collect::<Result<_, std::num::TryFromIntError>>()?;
 
-    // Random network magic.
-    let mut magic_bytes = [0u8; 4];
-    rng.fill_bytes(&mut magic_bytes);
+    // Network magic. When a seed is set, derive it deterministically so that a
+    // node regenerating the chain at each startup keeps a stable magic (external
+    // upstream-zebra peers identify the network by magic). Otherwise, random.
+    let magic_bytes = match options.seed {
+        Some(seed) => derive_network_magic(&seed),
+        None => {
+            let mut bytes = [0u8; 4];
+            rng.fill_bytes(&mut bytes);
+            bytes
+        }
+    };
 
     let network = build_network(BuildNetworkOptions {
         network_name: &options.network_name,
@@ -430,6 +475,34 @@ fn configured_activation_heights(
     })
 }
 
+/// Deterministically derive a 4-byte network magic from a seed.
+///
+/// Computes `sha256(seed || b"network-magic" || counter_le)` and takes the first
+/// four bytes, incrementing `counter` and retrying if the candidate collides with
+/// a magic that [`Parameters::build`](TestnetParams::build)'s `with_network_magic`
+/// rejects (the reserved Mainnet/Regtest magics). This keeps generation
+/// builder-error-free while producing a stable magic for a given seed.
+fn derive_network_magic(seed: &[u8; 32]) -> [u8; 4] {
+    let mut counter: u32 = 0;
+    loop {
+        let mut hasher = Sha256::new();
+        hasher.update(seed);
+        hasher.update(b"network-magic");
+        hasher.update(counter.to_le_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        let mut candidate = [0u8; 4];
+        candidate.copy_from_slice(&digest[..4]);
+
+        let magic = Magic(candidate);
+        if magic != magics::MAINNET && magic != magics::REGTEST {
+            break candidate;
+        }
+        counter = counter
+            .checked_add(1)
+            .expect("a non-reserved magic is found quickly");
+    }
+}
+
 /// RIPEMD-160(SHA-256(data)) - standard Bitcoin/Zcash hash160 for public keys.
 fn hash160(data: &[u8]) -> [u8; 20] {
     use ripemd::Digest as _;
@@ -590,6 +663,38 @@ mod tests {
             .collect();
 
         assert_eq!(deltas, vec![25; generated.blocks.len() - 1]);
+    }
+
+    #[test]
+    fn seeded_network_magic_is_deterministic_and_not_reserved() {
+        let seed = [7u8; 32];
+
+        let make = || {
+            generate_local_testnet_with_funded_keys(
+                vec!["alice".to_string(), "bob".to_string()],
+                LocalTestnetGenesisOptions {
+                    seed: Some(seed),
+                    seeded_tip_time: Some(10_000),
+                    disable_pow: true,
+                    ..Default::default()
+                },
+            )
+            .expect("local testnet should generate")
+        };
+
+        let first = make();
+        let second = make();
+
+        let magic = first.network.magic();
+        assert_eq!(
+            magic,
+            second.network.magic(),
+            "same seed must produce the same network magic"
+        );
+
+        assert_ne!(magic, magics::MAINNET);
+        assert_ne!(magic, magics::TESTNET);
+        assert_ne!(magic, magics::REGTEST);
     }
 
     #[test]
