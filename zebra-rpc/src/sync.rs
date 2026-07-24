@@ -344,22 +344,6 @@ impl TrustedChainSync {
                 continue;
             }
 
-            // Skip blocks that are already finalized on the secondary. The server streams its
-            // entire non-finalized chain on initial subscription, which can start below our
-            // secondary's finalized tip when the secondary has caught up past the server's
-            // non-finalized root. Trying to commit those blocks fails with NotReadyToBeCommitted
-            // and triggers an endless re-subscribe loop.
-            if let Some(height) = block.coinbase_height() {
-                if self
-                    .db
-                    .finalized_tip_height()
-                    .is_some_and(|tip| height <= tip)
-                {
-                    tracing::debug!(?height, "skipping block already finalized on secondary");
-                    continue;
-                }
-            }
-
             let block = SemanticallyVerifiedBlock::with_hash(Arc::new(block), hash);
             match self.try_commit(block.clone()).await {
                 Ok(()) => {
@@ -394,16 +378,38 @@ impl TrustedChainSync {
     ) -> Result<(), ValidateContextError> {
         self.try_catch_up_with_primary().await;
 
-        // When the non-finalized state is empty and the incoming block doesn't build directly on
-        // the secondary's finalized tip, the secondary's finalized state is lagging the primary's.
-        // The streamed non-finalized blocks start at the primary's finalized tip, which can be
-        // several blocks above ours, so the incoming block has no parent to attach to. Bridge that
-        // gap by fetching the missing (already-finalized) blocks from the primary, so the incoming
-        // block has a contiguous chain to commit onto.
-        if self.non_finalized_state.best_chain().is_none()
-            && self.db.finalized_tip_hash() != block.block.header.previous_block_hash
-        {
-            self.fill_finalized_gap(block.height).await;
+        // Zebra #10841 skips stale finalized replay by height. Require the secondary's canonical
+        // hash as well, and classify after catch-up so a conflicting block is never accepted as
+        // idempotent and a block finalized by this catch-up cannot enter a retry loop.
+        match cold_start_commit_action(
+            self.non_finalized_state.best_chain().is_none(),
+            self.db.finalized_tip_height(),
+            self.db.finalized_tip_hash(),
+            self.db.hash(block.height),
+            block.height,
+            block.hash,
+            block.block.header.previous_block_hash,
+        ) {
+            ColdStartCommitAction::SkipFinalizedReplay => {
+                tracing::debug!(
+                    height = ?block.height,
+                    hash = ?block.hash,
+                    "skipping exact block already finalized on secondary"
+                );
+
+                if let Some(finalized_tip_block) = finalized_chain_tip_block(&self.db).await {
+                    self.chain_tip_sender.set_finalized_tip(finalized_tip_block);
+                }
+
+                return Ok(());
+            }
+            ColdStartCommitAction::BridgeFinalizedGap => {
+                // The streamed non-finalized blocks start at the primary's finalized tip, which
+                // can be several blocks above ours. Fetch the missing already-finalized blocks so
+                // the incoming block has a contiguous chain to commit onto.
+                self.fill_finalized_gap(block.height).await;
+            }
+            ColdStartCommitAction::Commit => {}
         }
 
         self.commit(block)
@@ -595,6 +601,43 @@ impl TrustedChainSync {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ColdStartCommitAction {
+    SkipFinalizedReplay,
+    BridgeFinalizedGap,
+    Commit,
+}
+
+fn cold_start_commit_action(
+    non_finalized_is_empty: bool,
+    finalized_tip_height: Option<Height>,
+    finalized_tip_hash: block::Hash,
+    canonical_hash_at_height: Option<block::Hash>,
+    candidate_height: Height,
+    candidate_hash: block::Hash,
+    candidate_parent_hash: block::Hash,
+) -> ColdStartCommitAction {
+    if !non_finalized_is_empty {
+        return ColdStartCommitAction::Commit;
+    }
+
+    if finalized_tip_height.is_some_and(|tip| candidate_height <= tip) {
+        return if canonical_hash_at_height == Some(candidate_hash) {
+            ColdStartCommitAction::SkipFinalizedReplay
+        } else {
+            // A conflicting hash at an already-finalized height is not an idempotent replay.
+            // Let contextual validation reject it instead of silently accepting a divergent chain.
+            ColdStartCommitAction::Commit
+        };
+    }
+
+    if finalized_tip_hash != candidate_parent_hash {
+        ColdStartCommitAction::BridgeFinalizedGap
+    } else {
+        ColdStartCommitAction::Commit
+    }
+}
+
 /// Accepts a [zebra-state configuration](zebra_state::Config), a [`Network`], and
 /// the [`SocketAddr`] of a Zebra node's RPC server.
 ///
@@ -633,4 +676,61 @@ pub fn init_read_state_with_syncer(
             TrustedChainSync::spawn(indexer_rpc_address, db, non_finalized_state_sender).await?;
         Ok((read_state, latest_chain_tip, chain_tip_change, sync_task))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hash(byte: u8) -> block::Hash {
+        block::Hash([byte; 32])
+    }
+
+    #[test]
+    fn exact_stale_finalized_root_is_an_idempotent_replay() {
+        assert_eq!(
+            cold_start_commit_action(
+                true,
+                Some(Height(100)),
+                hash(3),
+                Some(hash(3)),
+                Height(100),
+                hash(3),
+                hash(2),
+            ),
+            ColdStartCommitAction::SkipFinalizedReplay
+        );
+    }
+
+    #[test]
+    fn same_height_different_hash_is_not_an_idempotent_replay() {
+        assert_eq!(
+            cold_start_commit_action(
+                true,
+                Some(Height(100)),
+                hash(3),
+                Some(hash(3)),
+                Height(100),
+                hash(4),
+                hash(2),
+            ),
+            ColdStartCommitAction::Commit
+        );
+    }
+
+    #[test]
+    fn missing_parent_above_finalized_tip_reaches_gap_recovery() {
+        assert_eq!(
+            cold_start_commit_action(
+                true,
+                Some(Height(100)),
+                hash(3),
+                None,
+                Height(102),
+                hash(5),
+                hash(4),
+            ),
+            ColdStartCommitAction::BridgeFinalizedGap
+        );
+    }
 }
