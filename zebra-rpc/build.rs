@@ -13,7 +13,11 @@ const ZALLET_COMMIT: Option<&str> = Some("027e5e2139b2ca8f0317edb9d802b03a46e9aa
 #[allow(dead_code)]
 const ZAINO_COMMIT: Option<&str> = Some("559510ffcc62a5a6e7bb20db5e3329654542c8b1");
 
+const REGENERATE_INDEXER_PROTO_ENV: &str = "ZEBRA_RPC_REGENERATE_INDEXER_PROTO";
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-env-changed={REGENERATE_INDEXER_PROTO_ENV}");
+
     build_or_copy_proto()?;
     build_zallet_for_qa_tests();
     build_rpc_schema()?;
@@ -27,13 +31,16 @@ fn build_or_copy_proto() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = env::var("OUT_DIR").map(PathBuf::from)?;
     let file_names = ["indexer_descriptor.bin", "zebra.indexer.rpc.rs"];
 
-    let is_proto_file_available = Path::new(PROTO_FILE_PATH).exists();
-    let is_protoc_available = env::var_os("PROTOC")
-        .map(PathBuf::from)
-        .or_else(|| which::which("protoc").ok())
-        .is_some();
+    // Git dependencies contain the source proto even though crates.io packages exclude it.
+    // Keep exact-source builds independent of the host's protoc unless explicitly requested.
+    let regenerate_proto = env::var_os(REGENERATE_INDEXER_PROTO_ENV).is_some()
+        && Path::new(PROTO_FILE_PATH).exists()
+        && env::var_os("PROTOC")
+            .map(PathBuf::from)
+            .or_else(|| which::which("protoc").ok())
+            .is_some();
 
-    if is_proto_file_available && is_protoc_available {
+    if regenerate_proto {
         tonic_prost_build::configure()
             .type_attribute(".", "#[derive(serde::Deserialize, serde::Serialize)]")
             .file_descriptor_set_path(out_dir.join("indexer_descriptor.bin"))
