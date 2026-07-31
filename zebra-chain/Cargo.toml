@@ -169,5 +169,9 @@ harness = false
 name = "transaction"
 harness = false
 
+[[example]]
+name = "dump_local_genesis_params"
+required-features = ["internal-miner"]
+
 [lints]
 workspace = true

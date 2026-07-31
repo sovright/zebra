@@ -265,7 +265,7 @@ impl StartCmd {
         let config = APPLICATION.config();
         let is_regtest = config.network.network.is_regtest();
 
-        let config = if is_regtest {
+        let mut config = if is_regtest {
             Arc::new(ZebradConfig {
                 mempool: mempool::Config {
                     debug_enable_at_height: Some(0),
@@ -334,6 +334,36 @@ impl StartCmd {
                 .await
                 .map_err(|err| eyre!("failed to join managed zcashd binary resolver: {err}"))??,
             )
+        } else {
+            None
+        };
+
+        // If `[local_genesis]` is configured, deterministically generate a brand-new,
+        // isolated single-node testnet (genesis + funded premine) from the seed, and use
+        // it as the active network. The generated blocks are committed to an empty state
+        // further below (mirroring the Regtest genesis commit). No peers, no public network.
+        let local_genesis_blocks = if let Some(local_genesis) = config.local_genesis.clone() {
+            let options = local_genesis
+                .to_options()
+                .map_err(|e| eyre!("invalid [local_genesis] config: {e}"))?;
+            let generated = zebra_chain::local_genesis::generate_local_testnet_with_funded_keys(
+                local_genesis.miners.clone(),
+                options,
+            )
+            .map_err(|e| eyre!("failed to generate local-genesis testnet: {e}"))?;
+
+            info!(
+                network_name = %local_genesis.network_name,
+                blocks = generated.blocks.len(),
+                funded_keys = generated.funded_keys.len(),
+                "generated isolated local-genesis testnet"
+            );
+
+            let mut new_config = Arc::unwrap_or_clone(config);
+            new_config.network.network = generated.network.clone();
+            config = Arc::new(new_config);
+
+            Some(generated.blocks)
         } else {
             None
         };
@@ -654,6 +684,28 @@ impl StartCmd {
                 config.network.network.genesis_hash(),
                 "validated block hash should match network genesis hash"
             )
+        }
+
+        // For a configured local-genesis testnet, commit the deterministically generated
+        // genesis + premine blocks directly to an empty state (no peer required), mirroring
+        // the Regtest path above. The internal miner then extends the chain from the tip.
+        if let Some(blocks) = &local_genesis_blocks {
+            if !syncer
+                .state_contains(config.network.network.genesis_hash())
+                .await?
+            {
+                for block in blocks {
+                    block_verifier_router
+                        .clone()
+                        .oneshot(zebra_consensus::Request::Commit(Arc::new(block.clone())))
+                        .await
+                        .map_err(|e| eyre!("failed to commit local-genesis block: {e}"))?;
+                }
+                info!(
+                    committed = blocks.len(),
+                    "committed local-genesis blocks to state"
+                );
+            }
         }
         let syncer_task_handle = tokio::spawn(syncer.sync().in_current_span());
 
